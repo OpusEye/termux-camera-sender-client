@@ -30,43 +30,121 @@ def check_deps() -> bool:
     return True
 
 
+def run_cmd(cmd, timeout=None):
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
 def supports_camera_index() -> bool:
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-h", "indev=android_camera"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
+        result = run_cmd(["ffmpeg", "-hide_banner", "-h", "indev=android_camera"])
         text = (result.stdout or "") + "\n" + (result.stderr or "")
         return "camera_index" in text
     except Exception:
         return False
 
 
-def build_command(args, use_camera_index: bool):
+def get_input_variants(args):
+    camera_variants = [
+        ["-camera_index", str(args.camera_id), "-i", "0"],
+        ["-camera_index", str(args.camera_id), "-i", "dummy"],
+    ]
+    input_variants = [
+        ["-i", str(args.camera_id)],
+        ["-i", "0"],
+        ["-i", "0:0"],
+    ]
+
+    if args.camera_mode == "camera_index":
+        return camera_variants
+    if args.camera_mode == "input_index":
+        return input_variants
+
+    if supports_camera_index():
+        return camera_variants + input_variants
+    return input_variants + camera_variants
+
+
+def unique_resolutions(width, height):
+    candidates = [(width, height), (960, 540), (640, 480)]
+    seen = set()
+    result = []
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def probe_input_settings(args):
+    variants = get_input_variants(args)
+    resolutions = unique_resolutions(args.width, args.height)
+    errors = []
+
+    for w, h in resolutions:
+        for input_args in variants:
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "android_camera",
+                "-framerate",
+                str(args.fps),
+                "-video_size",
+                f"{w}x{h}",
+                *input_args,
+                "-t",
+                "1",
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ]
+            try:
+                result = run_cmd(cmd, timeout=12)
+            except Exception as exc:
+                errors.append(f"{input_args} @ {w}x{h}: {exc}")
+                continue
+
+            if result.returncode == 0:
+                return input_args, w, h
+
+            stderr = (result.stderr or "").strip()
+            if "Unknown input format: 'android_camera'" in stderr:
+                raise RuntimeError(
+                    "Your ffmpeg build does not support android_camera input. "
+                    "Install a Termux ffmpeg build with android_camera enabled."
+                )
+            errors.append(f"{input_args} @ {w}x{h}: {stderr or 'unknown error'}")
+
+    details = "\n".join(errors[-6:])
+    raise RuntimeError(f"Failed to open Android camera.\nRecent probe errors:\n{details}")
+
+
+def build_stream_command(args, input_args, width, height):
     output_url = f"udp://{args.host}:{args.port}?pkt_size=1316"
     gop = max(args.fps * 2, 1)
-    input_part = [
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
         "-f",
         "android_camera",
         "-framerate",
         str(args.fps),
         "-video_size",
-        f"{args.width}x{args.height}",
-    ]
-    if use_camera_index:
-        input_part.extend(["-camera_index", str(args.camera_id), "-i", "0"])
-    else:
-        input_part.extend(["-i", str(args.camera_id)])
-
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        *input_part,
+        f"{width}x{height}",
+        *input_args,
         "-an",
         "-c:v",
         "libx264",
@@ -88,45 +166,31 @@ def build_command(args, use_camera_index: bool):
         "mpegts",
         output_url,
     ]
-    return command
 
 
 def stream_forever(args):
-    if args.camera_mode == "camera_index":
-        use_camera_index = True
-    elif args.camera_mode == "input_index":
-        use_camera_index = False
-    else:
-        use_camera_index = supports_camera_index()
+    try:
+        input_args, real_w, real_h = probe_input_settings(args)
+    except Exception as exc:
+        print(str(exc))
+        return
 
-    print(
-        "Camera mode:",
-        "camera_index" if use_camera_index else "input_index",
-    )
+    print(f"Selected camera args: {' '.join(input_args)}")
+    print(f"Selected resolution: {real_w}x{real_h}")
+
     while True:
-        cmd = build_command(args, use_camera_index)
+        cmd = build_stream_command(args, input_args, real_w, real_h)
         print("Starting ffmpeg stream:")
         print(" ".join(cmd))
         try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
+            proc = run_cmd(cmd)
             code = proc.returncode
             if code == 0:
                 print("ffmpeg exited normally.")
                 return
-            stderr = proc.stderr or ""
-            if "Unrecognized option 'camera_index'" in stderr or "Unrecognized option 'camer_index'" in stderr:
-                if use_camera_index:
-                    print("camera_index unsupported; switching to input_index mode.")
-                    use_camera_index = False
-                    continue
-            if stderr.strip():
-                print(stderr.strip())
+            stderr = (proc.stderr or "").strip()
+            if stderr:
+                print(stderr)
             print(f"ffmpeg exited with code {code}. Retrying in {args.retry_delay}s...")
             time.sleep(args.retry_delay)
         except KeyboardInterrupt:
