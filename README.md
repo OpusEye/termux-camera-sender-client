@@ -17,6 +17,14 @@ cd termux-camera-sender-client
 python sender_termux.py --host <RECEIVER_IP> --port 5001 --camera-id 0 --fps 30 --width 1280 --height 720 --bitrate 4000k
 `
 
+## If you get "Unrecognized option 'camer_index'"
+
+Use compatibility mode:
+
+`ash
+python sender_termux.py --host <RECEIVER_IP> --port 5001 --camera-id 0 --fps 30 --camera-mode input_index
+`
+
 ## Notes
 
 - For front camera usually use --camera-id 1.
