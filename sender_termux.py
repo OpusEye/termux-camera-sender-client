@@ -13,6 +13,12 @@ def parse_args():
     parser.add_argument("--width", type=int, default=1280, help="Capture width")
     parser.add_argument("--height", type=int, default=720, help="Capture height")
     parser.add_argument("--bitrate", default="4000k", help="Video bitrate (example: 4000k)")
+    parser.add_argument(
+        "--camera-mode",
+        choices=["auto", "camera_index", "input_index"],
+        default="auto",
+        help="Camera selection mode for android_camera input",
+    )
     parser.add_argument("--retry-delay", type=float, default=2.0, help="Retry delay on error")
     return parser.parse_args()
 
@@ -24,24 +30,43 @@ def check_deps() -> bool:
     return True
 
 
-def build_command(args):
+def supports_camera_index() -> bool:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-h", "indev=android_camera"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+        return "camera_index" in text
+    except Exception:
+        return False
+
+
+def build_command(args, use_camera_index: bool):
     output_url = f"udp://{args.host}:{args.port}?pkt_size=1316"
     gop = max(args.fps * 2, 1)
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
+    input_part = [
         "-f",
         "android_camera",
-        "-camera_index",
-        str(args.camera_id),
         "-framerate",
         str(args.fps),
         "-video_size",
         f"{args.width}x{args.height}",
-        "-i",
-        "0",
+    ]
+    if use_camera_index:
+        input_part.extend(["-camera_index", str(args.camera_id), "-i", "0"])
+    else:
+        input_part.extend(["-i", str(args.camera_id)])
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        *input_part,
         "-an",
         "-c:v",
         "libx264",
@@ -63,19 +88,45 @@ def build_command(args):
         "mpegts",
         output_url,
     ]
+    return command
 
 
 def stream_forever(args):
+    if args.camera_mode == "camera_index":
+        use_camera_index = True
+    elif args.camera_mode == "input_index":
+        use_camera_index = False
+    else:
+        use_camera_index = supports_camera_index()
+
+    print(
+        "Camera mode:",
+        "camera_index" if use_camera_index else "input_index",
+    )
     while True:
-        cmd = build_command(args)
+        cmd = build_command(args, use_camera_index)
         print("Starting ffmpeg stream:")
         print(" ".join(cmd))
         try:
-            proc = subprocess.Popen(cmd)
-            code = proc.wait()
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            code = proc.returncode
             if code == 0:
                 print("ffmpeg exited normally.")
                 return
+            stderr = proc.stderr or ""
+            if "Unrecognized option 'camera_index'" in stderr or "Unrecognized option 'camer_index'" in stderr:
+                if use_camera_index:
+                    print("camera_index unsupported; switching to input_index mode.")
+                    use_camera_index = False
+                    continue
+            if stderr.strip():
+                print(stderr.strip())
             print(f"ffmpeg exited with code {code}. Retrying in {args.retry_delay}s...")
             time.sleep(args.retry_delay)
         except KeyboardInterrupt:
