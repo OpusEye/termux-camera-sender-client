@@ -1,221 +1,100 @@
 import argparse
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import time
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Termux 30 FPS camera sender (H264)")
-    parser.add_argument("--host", required=True, help="Receiver IP/host")
-    parser.add_argument("--port", type=int, default=5001, help="Receiver UDP port")
+    parser = argparse.ArgumentParser(description="Termux camera sender (termux-camera-photo)")
+    parser.add_argument("--host", required=True, help="Receiver host/IP")
+    parser.add_argument("--port", type=int, default=5001, help="Receiver TCP port")
+    parser.add_argument("--token", required=True, help="Shared auth token")
     parser.add_argument("--camera-id", type=int, default=0, help="Android camera index")
-    parser.add_argument("--fps", type=int, default=30, help="Target FPS (e.g. 30)")
-    parser.add_argument("--width", type=int, default=1280, help="Capture width")
-    parser.add_argument("--height", type=int, default=720, help="Capture height")
-    parser.add_argument("--bitrate", default="4000k", help="Video bitrate (example: 4000k)")
+    parser.add_argument("--fps", type=float, default=1.0, help="Capture FPS (recommended: 0.5-2)")
     parser.add_argument(
-        "--ffmpeg-bin",
-        default="ffmpeg",
-        help="Path to ffmpeg binary (default: ffmpeg from PATH)",
+        "--tmp-file",
+        default="/data/data/com.termux/files/usr/tmp/cam_frame.jpg",
+        help="Temporary file for captured frame",
     )
-    parser.add_argument(
-        "--camera-mode",
-        choices=["auto", "camera_index", "input_index"],
-        default="auto",
-        help="Camera selection mode for android_camera input",
-    )
-    parser.add_argument("--retry-delay", type=float, default=2.0, help="Retry delay on error")
+    parser.add_argument("--connect-timeout", type=float, default=10.0, help="TCP connect timeout")
+    parser.add_argument("--retry-delay", type=float, default=2.0, help="Retry delay")
     return parser.parse_args()
 
 
-def check_deps(ffmpeg_bin: str) -> bool:
-    if "/" in ffmpeg_bin:
-        exists = shutil.which(ffmpeg_bin) is not None or os.path.exists(ffmpeg_bin)
-    else:
-        exists = shutil.which(ffmpeg_bin) is not None
-    if not exists:
-        print(f"ffmpeg binary not found: {ffmpeg_bin}")
-        print("Install with: pkg install ffmpeg")
+def check_deps() -> bool:
+    if shutil.which("termux-camera-photo") is None:
+        print("termux-camera-photo not found.")
+        print("Install: pkg install termux-api")
+        print("Also install Android app: Termux:API")
         return False
     return True
 
 
-def run_cmd(cmd, timeout=None):
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
+def capture_frame(camera_id: int, tmp_file: str) -> bytes:
+    if os.path.exists(tmp_file):
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
 
+    cmd = ["termux-camera-photo", "-c", str(camera_id), tmp_file]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "capture failed").strip())
 
-def supports_camera_index(ffmpeg_bin: str) -> bool:
-    try:
-        result = run_cmd([ffmpeg_bin, "-hide_banner", "-h", "indev=android_camera"])
-        text = (result.stdout or "") + "\n" + (result.stderr or "")
-        return "camera_index" in text
-    except Exception:
-        return False
-
-
-def get_input_variants(args):
-    camera_variants = [
-        ["-camera_index", str(args.camera_id), "-i", "0"],
-        ["-camera_index", str(args.camera_id), "-i", "dummy"],
-    ]
-    input_variants = [
-        ["-i", str(args.camera_id)],
-        ["-i", "0"],
-        ["-i", "0:0"],
-    ]
-
-    if args.camera_mode == "camera_index":
-        return camera_variants
-    if args.camera_mode == "input_index":
-        return input_variants
-
-    if supports_camera_index(args.ffmpeg_bin):
-        return camera_variants + input_variants
-    return input_variants + camera_variants
-
-
-def unique_resolutions(width, height):
-    candidates = [(width, height), (960, 540), (640, 480)]
-    seen = set()
-    result = []
-    for item in candidates:
-        if item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def probe_input_settings(args):
-    variants = get_input_variants(args)
-    resolutions = unique_resolutions(args.width, args.height)
-    errors = []
-
-    for w, h in resolutions:
-        for input_args in variants:
-            cmd = [
-                args.ffmpeg_bin,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "android_camera",
-                "-framerate",
-                str(args.fps),
-                "-video_size",
-                f"{w}x{h}",
-                *input_args,
-                "-t",
-                "1",
-                "-an",
-                "-f",
-                "null",
-                "-",
-            ]
-            try:
-                result = run_cmd(cmd, timeout=12)
-            except Exception as exc:
-                errors.append(f"{input_args} @ {w}x{h}: {exc}")
-                continue
-
-            if result.returncode == 0:
-                return input_args, w, h
-
-            stderr = (result.stderr or "").strip()
-            if "Unknown input format: 'android_camera'" in stderr:
-                raise RuntimeError(
-                    "Your ffmpeg build does not support android_camera input. "
-                    "Install a Termux ffmpeg build with android_camera enabled."
-                )
-            errors.append(f"{input_args} @ {w}x{h}: {stderr or 'unknown error'}")
-
-    details = "\n".join(errors[-6:])
-    raise RuntimeError(f"Failed to open Android camera.\nRecent probe errors:\n{details}")
-
-
-def build_stream_command(args, input_args, width, height):
-    output_url = f"udp://{args.host}:{args.port}?pkt_size=1316"
-    gop = max(args.fps * 2, 1)
-    return [
-        args.ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-f",
-        "android_camera",
-        "-framerate",
-        str(args.fps),
-        "-video_size",
-        f"{width}x{height}",
-        *input_args,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-pix_fmt",
-        "yuv420p",
-        "-g",
-        str(gop),
-        "-b:v",
-        args.bitrate,
-        "-maxrate",
-        args.bitrate,
-        "-bufsize",
-        args.bitrate,
-        "-f",
-        "mpegts",
-        output_url,
-    ]
+    with open(tmp_file, "rb") as f:
+        data = f.read()
+    if not data:
+        raise RuntimeError("empty frame file")
+    return data
 
 
 def stream_forever(args):
-    try:
-        input_args, real_w, real_h = probe_input_settings(args)
-    except Exception as exc:
-        print(str(exc))
-        return
-
-    print(f"Selected camera args: {' '.join(input_args)}")
-    print(f"Selected resolution: {real_w}x{real_h}")
+    if args.fps <= 0:
+        raise ValueError("fps must be > 0")
+    frame_interval = 1.0 / args.fps
+    os.makedirs(os.path.dirname(args.tmp_file), exist_ok=True)
 
     while True:
-        cmd = build_stream_command(args, input_args, real_w, real_h)
-        print("Starting ffmpeg stream:")
-        print(" ".join(cmd))
+        sock = None
         try:
-            proc = run_cmd(cmd)
-            code = proc.returncode
-            if code == 0:
-                print("ffmpeg exited normally.")
-                return
-            stderr = (proc.stderr or "").strip()
-            if stderr:
-                print(stderr)
-            print(f"ffmpeg exited with code {code}. Retrying in {args.retry_delay}s...")
-            time.sleep(args.retry_delay)
+            print(f"Connecting to {args.host}:{args.port} ...")
+            sock = socket.create_connection((args.host, args.port), timeout=args.connect_timeout)
+            sock.sendall(f"HELLO {args.token}\n".encode("utf-8"))
+            print("Connected. Streaming...")
+            sent = 0
+            while True:
+                t0 = time.time()
+                frame = capture_frame(args.camera_id, args.tmp_file)
+                sock.sendall(struct.pack(">I", len(frame)))
+                sock.sendall(frame)
+                sent += 1
+                print(f"Sent frame #{sent}, bytes={len(frame)}")
+                elapsed = time.time() - t0
+                wait = frame_interval - elapsed
+                if wait > 0:
+                    time.sleep(wait)
         except KeyboardInterrupt:
             print("Stopped by user.")
             return
         except Exception as exc:
-            print(f"Failed to start stream: {exc}")
+            print(f"Stream error: {exc}")
             print(f"Retrying in {args.retry_delay}s...")
             time.sleep(args.retry_delay)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
 
 def main():
     args = parse_args()
-    if not check_deps(args.ffmpeg_bin):
+    if not check_deps():
         return
     stream_forever(args)
 
