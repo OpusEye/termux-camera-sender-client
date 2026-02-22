@@ -1,4 +1,5 @@
 import argparse
+import os
 import shutil
 import subprocess
 import time
@@ -14,6 +15,11 @@ def parse_args():
     parser.add_argument("--height", type=int, default=720, help="Capture height")
     parser.add_argument("--bitrate", default="4000k", help="Video bitrate (example: 4000k)")
     parser.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="Path to ffmpeg binary (default: ffmpeg from PATH)",
+    )
+    parser.add_argument(
         "--camera-mode",
         choices=["auto", "camera_index", "input_index"],
         default="auto",
@@ -23,9 +29,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def check_deps() -> bool:
-    if shutil.which("ffmpeg") is None:
-        print("ffmpeg not found. Install with: pkg install ffmpeg")
+def check_deps(ffmpeg_bin: str) -> bool:
+    if "/" in ffmpeg_bin:
+        exists = shutil.which(ffmpeg_bin) is not None or os.path.exists(ffmpeg_bin)
+    else:
+        exists = shutil.which(ffmpeg_bin) is not None
+    if not exists:
+        print(f"ffmpeg binary not found: {ffmpeg_bin}")
+        print("Install with: pkg install ffmpeg")
         return False
     return True
 
@@ -41,9 +52,9 @@ def run_cmd(cmd, timeout=None):
     )
 
 
-def supports_camera_index() -> bool:
+def supports_camera_index(ffmpeg_bin: str) -> bool:
     try:
-        result = run_cmd(["ffmpeg", "-hide_banner", "-h", "indev=android_camera"])
+        result = run_cmd([ffmpeg_bin, "-hide_banner", "-h", "indev=android_camera"])
         text = (result.stdout or "") + "\n" + (result.stderr or "")
         return "camera_index" in text
     except Exception:
@@ -66,7 +77,7 @@ def get_input_variants(args):
     if args.camera_mode == "input_index":
         return input_variants
 
-    if supports_camera_index():
+    if supports_camera_index(args.ffmpeg_bin):
         return camera_variants + input_variants
     return input_variants + camera_variants
 
@@ -91,7 +102,7 @@ def probe_input_settings(args):
     for w, h in resolutions:
         for input_args in variants:
             cmd = [
-                "ffmpeg",
+                args.ffmpeg_bin,
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -134,7 +145,7 @@ def build_stream_command(args, input_args, width, height):
     output_url = f"udp://{args.host}:{args.port}?pkt_size=1316"
     gop = max(args.fps * 2, 1)
     return [
-        "ffmpeg",
+        args.ffmpeg_bin,
         "-hide_banner",
         "-loglevel",
         "warning",
@@ -204,7 +215,7 @@ def stream_forever(args):
 
 def main():
     args = parse_args()
-    if not check_deps():
+    if not check_deps(args.ffmpeg_bin):
         return
     stream_forever(args)
 
